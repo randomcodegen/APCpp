@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+
 constexpr int AP_OFFLINE_SLOT = 1404;
 constexpr char const* AP_OFFLINE_NAME = "You";
 constexpr AP_NetworkVersion AP_DEFAULT_NETWORK_VERSION = {0,5,1}; // Default for compatibility reasons
@@ -422,7 +423,7 @@ void AP_SetItemClearCallback(std::function<void()> f_itemclr) {
     resetItemValues = f_itemclr;
 }
 
-void AP_SetItemRecvCallback(std::function<void(int64_t,bool)> f_itemrecv) {
+void AP_SetItemRecvCallback(std::function<void(int64_t,int,bool)> f_itemrecv) {
     getitemfunc = f_itemrecv;
 }
 
