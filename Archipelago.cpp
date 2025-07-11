@@ -31,6 +31,7 @@ bool refused = false;
 bool multiworld = true;
 bool isSSL = true;
 bool ssl_success = false;
+bool data_synced = false;
 int ap_player_id;
 std::string ap_player_name;
 size_t ap_player_name_hash;
@@ -108,6 +109,8 @@ std::string getLocationName(std::string game, int64_t id);
 void parseDataPkg(Json::Value new_datapkg);
 void parseDataPkg();
 AP_NetworkPlayer getPlayer(int team, int slot);
+void localSetServerData(Json::Value req);
+std::string messagePartsToPlainText(const std::vector<AP_MessagePart>& messageParts);
 // PRIV Func Declarations End
 
 void AP_Init(const char* ip, const char* game, const char* player_name, const char* passwd) {
@@ -200,6 +203,8 @@ void AP_Start() {
             sp_save_root["checked_locations"] = Json::arrayValue;
             sp_save_root["store"] = Json::objectValue;
         }
+        // Seed for savegame names etc
+        lib_room_info.seed_name = sp_ap_root["seed"].asString();
         // Only game in the data package is our game
         ap_game = sp_ap_root["data_package"]["data"]["games"].getMemberNames()[0];
         Json::Value fake_msg;
@@ -223,6 +228,13 @@ void AP_Start() {
         fake_msg[0]["cmd"] = "ReceivedItems";
         fake_msg[0]["index"] = 0;
         fake_msg[0]["items"] = Json::arrayValue;
+		for (unsigned int i = 0; i < sp_ap_root["start_inventory"].size(); i++) {
+            Json::Value item;
+            item["item"] = sp_ap_root["start_inventory"][i].asInt64();
+            item["location"] = 0;
+            item["player"] = ap_player_id;
+            fake_msg[0]["items"].append(item);
+        }
         for (unsigned int i = 0; i < sp_save_root["checked_locations"].size(); i++) {
             Json::Value item;
             item["item"] = sp_ap_root["location_to_item"][sp_save_root["checked_locations"][i].asString()].asInt64();
@@ -243,6 +255,7 @@ void AP_Shutdown() {
     auth = false;
     refused = false;
     multiworld = true;
+	data_synced = false;
     isSSL = true;
     ssl_success = false;
     ap_player_id = 0;
@@ -252,6 +265,7 @@ void AP_Shutdown() {
     ap_passwd.clear();
     ap_uuid = 0;
     client_version = AP_DEFAULT_NETWORK_VERSION;
+	rando = std::mt19937();
     deathlinkstat = false;
     deathlinksupported = false;
     enable_deathlink = false;
@@ -497,6 +511,17 @@ AP_ConnectionStatus AP_GetConnectionStatus() {
     return AP_ConnectionStatus::Disconnected;
 }
 
+AP_DataPackageSyncStatus AP_GetDataPackageStatus() {
+    if (!auth) {
+        return AP_DataPackageSyncStatus::NotChecked;
+    }
+    if (data_synced) {
+        return AP_DataPackageSyncStatus::Synced;
+    } else {
+        return AP_DataPackageSyncStatus::SyncPending;
+    }
+}
+
 std::uint64_t AP_GetUUID() {
     return ap_uuid;
 }
@@ -580,6 +605,15 @@ void AP_GetServerData(AP_GetServerDataRequest* request) {
 std::string AP_GetPrivateServerDataPrefix() {
     return "APCpp" + std::to_string(ap_player_name_hash) + "APCpp" + std::to_string(ap_player_id) + "APCpp";
 }
+
+std::string AP_GetLocationName(int64_t id) {
+    return getLocationName(ap_game, id);
+}
+
+std::string AP_GetItemName(int64_t id) {
+    return getItemName(ap_game, id);
+}
+
 
 void AP_SendBounce(AP_Bounce bounce) {
     Json::Value req_t;
@@ -814,6 +848,7 @@ bool parse_response(std::string msg, std::string &request) {
                 msg->item = getItemName(recv_player.game, root[i]["item"]["item"].asInt64());
                 msg->recvPlayer = recv_player.alias;
                 msg->text = msg->item + std::string(" was sent to ") + msg->recvPlayer;
+				msg->messageParts = {{msg->item, AP_ItemText}, {" was sent to "}, {msg->recvPlayer, AP_PlayerText}};
                 messageQueue.push_back(msg);
             } else if (printType == "Hint") {
                 AP_NetworkPlayer send_player = getPlayer(0, root[i]["item"]["player"].asInt());
@@ -826,11 +861,13 @@ bool parse_response(std::string msg, std::string &request) {
                 msg->location = getLocationName(send_player.game, root[i]["item"]["location"].asInt64());
                 msg->checked = root[i]["found"].asBool();
                 msg->text = std::string("Item ") + msg->item + std::string(" from ") + msg->sendPlayer + std::string(" to ") + msg->recvPlayer + std::string(" at ") + msg->location + std::string((msg->checked ? " (Checked)" : " (Unchecked)"));
+				msg->messageParts = {{"Item "}, {msg->item, AP_ItemText}, {" from "}, {msg->sendPlayer, AP_PlayerText}, {" to "}, {msg->recvPlayer, AP_PlayerText}, {" at "}, {msg->location, AP_LocationText}, {msg->checked ? " (Checked)" : " (Unchecked)"}};
                 messageQueue.push_back(msg);
             } else if (printType == "Countdown") {
                 AP_CountdownMessage* msg = new AP_CountdownMessage;
                 msg->type = AP_MessageType::Countdown;
                 msg->timer = root[i]["countdown"].asInt();
+				msg->messageParts = {{root[i]["data"][0]["text"].asString()}};
                 msg->text = root[i]["data"][0]["text"].asString();
                 messageQueue.push_back(msg);
             } else {
@@ -878,6 +915,7 @@ bool parse_response(std::string msg, std::string &request) {
                     msg->item = getItemName(ap_game, item_id);
                     msg->sendPlayer = sender.alias;
                     msg->text = std::string("Received ") + msg->item + std::string(" from ") + msg->sendPlayer;
+					msg->messageParts = {{"Received "}, {msg->item, AP_ItemText}, {" from "}, {msg->sendPlayer, AP_PlayerText}};
                     messageQueue.push_back(msg);
                 }
             }
@@ -998,6 +1036,7 @@ void parseDataPkg() {
             map_location_id_name[{game,game_data["location_name_to_id"][location].asInt64()}] = location;
         }
     }
+	data_synced = true;
 }
 
 std::string getItemName(std::string game, int64_t id) {
@@ -1012,4 +1051,46 @@ std::string getLocationName(std::string game, int64_t id) {
 
 AP_NetworkPlayer getPlayer(int team, int slot) {
     return map_players[slot];
+}
+
+void localSetServerData(Json::Value req)
+{
+    std::string key = req["key"].asString();
+    Json::Value tmp_val = sp_save_root["store"][key];
+    Json::Value old;
+    old.copy(tmp_val);
+
+    if (tmp_val.isNull())
+        // Use default value from request instead
+        tmp_val = req["default"];
+
+    for (unsigned int i = 0; i < req["operations"].size(); i++)
+    {
+        const char* op = req["operations"][i]["operation"].asCString();
+        Json::Value value = req["operations"][i]["value"];
+
+        // ToDo support more operations
+        if (!strcmp(op,"replace")) {
+            tmp_val = value;
+        }
+    }
+
+    // Store the updated values
+    sp_save_root["store"][key] = tmp_val;
+    WriteFileJSON(sp_save_root, sp_save_path);
+
+    Json::Value fake_msg;
+    fake_msg[0]["cmd"] = "SetReply";
+    fake_msg[0]["key"] = key;
+    fake_msg[0]["value"] = tmp_val;
+    fake_msg[0]["original_value"] = old;
+    std::string fake_req;
+    parse_response(writer.write(fake_msg), fake_req);
+}
+
+std::string messagePartsToPlainText(const std::vector<AP_MessagePart>& messageParts) {
+    std::string out;
+    for (const auto& str : messageParts)
+        out += str.text;
+    return out;
 }

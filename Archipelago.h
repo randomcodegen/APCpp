@@ -54,7 +54,7 @@ void AP_SetDeathLinkSupported(bool);
 //Parameter Function must reset local state
 void AP_SetItemClearCallback(std::function<void()> f_itemclr);
 //Parameter Function must collect item id given with parameter. Secound parameter indicates whether or not to notify player
-void AP_SetItemRecvCallback(std::function<void(int64_t,bool)> f_itemrecv);
+void AP_SetItemRecvCallback(std::function<void(int64_t,int,bool)> f_itemrecv);
 //Parameter Function must mark given location id as checked
 void AP_SetLocationCheckedCallback(std::function<void(int64_t)> f_locrecv);
 
@@ -90,15 +90,28 @@ bool AP_DeathLinkPending();
 void AP_DeathLinkClear();
 void AP_DeathLinkSend();
 
+/* Name Mapping Functions */
+
+std::string AP_GetLocationName(int64_t);
+std::string AP_GetItemName(int64_t);
 /* Message Management Types */
 
 enum struct AP_MessageType {
     Plaintext, ItemSend, ItemRecv, Hint, Countdown
 };
 
+enum AP_MessagePartType {
+    AP_NormalText, AP_LocationText, AP_ItemText, AP_PlayerText
+};
+
+struct AP_MessagePart {
+    std::string text;
+    AP_MessagePartType type;
+};
 struct AP_Message {
     AP_MessageType type = AP_MessageType::Plaintext;
     std::string text;
+	std::vector<AP_MessagePart> messageParts;
 };
 
 struct AP_ItemSendMessage : AP_Message {
@@ -137,6 +150,9 @@ enum struct AP_ConnectionStatus {
     Disconnected, Connected, Authenticated, ConnectionRefused
 };
 
+enum struct AP_DataPackageSyncStatus {
+    NotChecked, SyncPending, Synced
+};
 #define AP_PERMISSION_DISABLED 0b000
 #define AP_PERMISSION_ENABLED 0b001
 #define AP_PERMISSION_GOAL 0b010
@@ -160,6 +176,7 @@ struct AP_RoomInfo {
 int AP_GetRoomInfo(AP_RoomInfo*);
 AP_ConnectionStatus AP_GetConnectionStatus();
 std::uint64_t AP_GetUUID();
+AP_DataPackageSyncStatus AP_GetDataPackageStatus();
 int AP_GetPlayerID();
 
 /* Serverside Data Types */
