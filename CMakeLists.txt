@@ -48,6 +48,7 @@ endif (NOT MINGW)
 if (MINGW OR NOT ZLIB_FOUND)
     # Force static build for zlib if not in system, and alias static to shared for IXWebsocket
     set(ZLIB_BUILD_SHARED OFF)
+    set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
     include(FetchContent)
     FetchContent_Declare(
         zlib
@@ -92,3 +93,11 @@ if (WIN32)
 endif(WIN32)
 
 install(TARGETS APCpp PUBLIC_HEADER)
+
+option(APCPP_BUILD_TESTS "Build APCpp tests" OFF)
+if (APCPP_BUILD_TESTS)
+    enable_testing()
+    add_executable(APCppThreadSafetyTest tests/thread_safety_test.cpp)
+    target_link_libraries(APCppThreadSafetyTest PRIVATE APCpp)
+    add_test(NAME APCppThreadSafety COMMAND APCppThreadSafetyTest)
+endif()

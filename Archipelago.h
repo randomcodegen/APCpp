@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <set>
 #include <functional>
+#include <atomic>
 
 void AP_Init(const char*, const char*, const char*, const char*);
 void AP_Init(const char*);
@@ -13,7 +14,7 @@ bool AP_IsInit();
 
 void AP_Start();
 
-// AP_Shutdown resets the library state to before initialization, and doesn't just disconnect!
+// AP_Shutdown resets the library state to before initialization, and doesn't just disconnect
 void AP_Shutdown();
 
 struct AP_NetworkVersion {
@@ -109,6 +110,7 @@ struct AP_MessagePart {
     AP_MessagePartType type;
 };
 struct AP_Message {
+    virtual ~AP_Message() = default;
     AP_MessageType type = AP_MessageType::Plaintext;
     std::string text;
 	std::vector<AP_MessagePart> messageParts;
@@ -122,6 +124,7 @@ struct AP_ItemSendMessage : AP_Message {
 struct AP_ItemRecvMessage : AP_Message {
     std::string item;
     std::string sendPlayer;
+    int64_t location = 0;
 };
 
 struct AP_HintMessage : AP_Message {
@@ -140,7 +143,11 @@ struct AP_CountdownMessage : AP_Message {
 
 bool AP_IsMessagePending();
 void AP_ClearLatestMessage();
+// Legacy GetMessage: only single thread
 AP_Message* AP_GetLatestMessage();
+// Atomically removes and transfers ownership of the oldest message. (threadsafe)
+AP_Message* AP_PopLatestMessage();
+void AP_FreeMessage(AP_Message* message);
 
 void AP_Say(std::string);
 
@@ -175,6 +182,7 @@ struct AP_RoomInfo {
 
 int AP_GetRoomInfo(AP_RoomInfo*);
 AP_ConnectionStatus AP_GetConnectionStatus();
+std::string AP_GetConnectionError();
 std::uint64_t AP_GetUUID();
 AP_DataPackageSyncStatus AP_GetDataPackageStatus();
 int AP_GetPlayerID();
@@ -190,7 +198,7 @@ enum struct AP_DataType {
 };
 
 struct AP_GetServerDataRequest {
-    AP_RequestStatus status;
+    std::atomic<AP_RequestStatus> status{AP_RequestStatus::Pending};
     std::string key;
     void* value;
     AP_DataType type;
@@ -202,7 +210,7 @@ struct AP_DataStorageOperation {
 };
 
 struct AP_SetServerDataRequest {
-    AP_RequestStatus status;
+    std::atomic<AP_RequestStatus> status{AP_RequestStatus::Pending};
     std::string key;
     std::vector<AP_DataStorageOperation> operations;
     void* default_value;

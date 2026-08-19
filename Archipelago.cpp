@@ -19,16 +19,21 @@
 #include <functional>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <mutex>
 
 
 constexpr int AP_OFFLINE_SLOT = 1404;
 constexpr char const* AP_OFFLINE_NAME = "You";
 constexpr AP_NetworkVersion AP_DEFAULT_NETWORK_VERSION = {0,5,1}; // Default for compatibility reasons
+std::recursive_mutex state_mutex;
+bool shutting_down = false;
 
 //Setup Stuff
 bool init = false;
 bool auth = false;
 bool refused = false;
+std::string connection_error;
 bool multiworld = true;
 bool isSSL = true;
 bool ssl_success = false;
@@ -114,8 +119,23 @@ void localSetServerData(Json::Value req);
 std::string messagePartsToPlainText(const std::vector<AP_MessagePart>& messageParts);
 // PRIV Func Declarations End
 
+template <typename Callback>
+void CallUnlocked(std::unique_lock<std::recursive_mutex>& lock, Callback callback) {
+    lock.unlock();
+    try {
+        callback();
+    } catch (...) {
+        lock.lock();
+        throw;
+    }
+    lock.lock();
+}
+
 void AP_Init(const char* ip, const char* game, const char* player_name, const char* passwd) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     multiworld = true;
+    connection_error.clear();
     
     uint64_t milliseconds_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     rando = std::mt19937(milliseconds_since_epoch);
@@ -151,11 +171,14 @@ void AP_Init(const char* ip, const char* game, const char* player_name, const ch
             }
             else if (msg->type == ix::WebSocketMessageType::Error || msg->type == ix::WebSocketMessageType::Close)
             {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                if (shutting_down) return;
                 auth = false;
-                for (std::pair<std::string,AP_GetServerDataRequest*> itr : map_server_data) {
-                    itr.second->status = AP_RequestStatus::Error;
-                    map_server_data.erase(itr.first);
+                if (connection_error.empty()) connection_error = msg->errorInfo.reason;
+                for (const auto& itr : map_server_data) {
+                    itr.second->status.store(AP_RequestStatus::Error, std::memory_order_release);
                 }
+                map_server_data.clear();
                 printf("AP: Error connecting to Archipelago. Retries: %d\n", msg->errorInfo.retries-1);
                 if (msg->errorInfo.retries-1 >= 2 && isSSL && !ssl_success) {
                     printf("AP: SSL connection failed. Attempting unencrypted...\n");
@@ -181,7 +204,10 @@ void AP_Init(const char* ip, const char* game, const char* player_name, const ch
 }
 
 void AP_Init(const char* filename) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     multiworld = false;
+    connection_error.clear();
     std::ifstream mwfile(filename);
     reader.parse(mwfile,sp_ap_root);
     mwfile.close();
@@ -195,6 +221,8 @@ void AP_Init(const char* filename) {
 }
 
 void AP_Start() {
+    std::unique_lock<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     init = true;
     if (multiworld) {
         webSocket.start();
@@ -220,11 +248,19 @@ void AP_Start() {
         fake_msg[0]["checked_locations"] = sp_save_root["checked_locations"];
         fake_msg[0]["slot_data"] = sp_ap_root["slot_data"];
         std::string req;
-        parse_response(writer.write(fake_msg), req);
+        const std::string connected = writer.write(fake_msg);
+        lock.unlock();
+        parse_response(connected, req);
+        lock.lock();
+        if (shutting_down) return;
         fake_msg.clear();
         fake_msg[0]["cmd"] = "DataPackage";
         fake_msg[0]["data"] = sp_ap_root["data_package"]["data"];
-        parse_response(writer.write(fake_msg), req);
+        const std::string package = writer.write(fake_msg);
+        lock.unlock();
+        parse_response(package, req);
+        lock.lock();
+        if (shutting_down) return;
         fake_msg.clear();
         fake_msg[0]["cmd"] = "ReceivedItems";
         fake_msg[0]["index"] = 0;
@@ -243,18 +279,31 @@ void AP_Start() {
             item["player"] = ap_player_id;
             fake_msg[0]["items"].append(item);
         }
-        parse_response(writer.write(fake_msg), req);
+        const std::string items = writer.write(fake_msg);
+        lock.unlock();
+        parse_response(items, req);
     }
 }
 
 void AP_Shutdown() {
-    if (multiworld)
+    bool stop_websocket = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (shutting_down) return;
+        shutting_down = true;
+        init = false;
+        stop_websocket = multiworld;
+    }
+    if (stop_websocket)
         webSocket.stop();
+
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     // Reset all states
     init = false;
     auth = false;
     refused = false;
+    connection_error.clear();
     multiworld = true;
 	data_synced = false;
     isSSL = true;
@@ -272,7 +321,10 @@ void AP_Shutdown() {
     enable_deathlink = false;
     deathlink_amnesty = 0;
     cur_deathlink_amnesty = 0;
-    while (AP_IsMessagePending()) AP_ClearLatestMessage();
+    while (!messageQueue.empty()) {
+        delete messageQueue.front();
+        messageQueue.pop_front();
+    }
     queueitemrecvmsg = true;
     map_players.clear();
     map_location_id_name.clear();
@@ -283,24 +335,33 @@ void AP_Shutdown() {
     locinfofunc = nullptr;
     recvdeath = nullptr;
     setreplyfunc = nullptr;
+    bouncedfunc = nullptr;
     map_serverdata_typemanage.clear();
     last_item_idx = 0;
     sp_save_path.clear();
     sp_save_root.clear();
-    map_server_data.clear(); // Does this leak?
+    for (const auto& request : map_server_data) {
+        request.second->status.store(AP_RequestStatus::Error, std::memory_order_release);
+    }
+    map_server_data.clear();
     map_slotdata_callback_int.clear();
     map_slotdata_callback_raw.clear();
     map_slotdata_callback_mapintint.clear();
     slotdata_strings.clear();
     datapkg_cache = Json::objectValue;
     sp_ap_root = Json::objectValue;
+    shutting_down = false;
 }
 
 bool AP_IsInit() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return false;
     return init;
 }
 
 void AP_SetClientVersion(AP_NetworkVersion* version) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || version == nullptr) return;
     client_version.major = version->major;
     client_version.minor = version->minor;
     client_version.build = version->build;
@@ -310,6 +371,8 @@ void AP_SendItem(int64_t idx) {
     AP_SendItem(std::set<int64_t>{ idx });
 }
 void AP_SendItem(std::set<int64_t> const& locations) {
+    std::unique_lock<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     for (int64_t idx : locations) {
         printf("AP: Checked '%s'.\n", getLocationName(ap_game, idx).c_str());
     }
@@ -347,8 +410,7 @@ void AP_SendItem(std::set<int64_t> const& locations) {
             item["player"] = ap_player_id;
             fake_msg[0]["items"].append(item);
         }
-        std::string req;
-        parse_response(writer.write(fake_msg), req);
+        const std::string received_items = writer.write(fake_msg);
 
         fake_msg.clear();
         fake_msg[0]["cmd"] = "RoomUpdate";
@@ -358,11 +420,18 @@ void AP_SendItem(std::set<int64_t> const& locations) {
             sp_save_root["checked_locations"].append(idx);
         }
         WriteFileJSON(sp_save_root, sp_save_path);
-        parse_response(writer.write(fake_msg), req);
+        const std::string room_update = writer.write(fake_msg);
+
+        std::string req;
+        lock.unlock();
+        parse_response(received_items, req);
+        parse_response(room_update, req);
     }
 }
 
 void AP_SendLocationScouts(std::set<int64_t> const& locations, int create_as_hint) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     if (multiworld) {
         Json::Value req_t;
         req_t[0]["cmd"] = "LocationScouts";
@@ -388,6 +457,8 @@ void AP_SendLocationScouts(std::set<int64_t> const& locations, int create_as_hin
 }
 
 void AP_StoryComplete() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     if (!multiworld) return;
     Json::Value req_t;
     req_t[0]["cmd"] = "StatusUpdate";
@@ -396,6 +467,8 @@ void AP_StoryComplete() {
 }
 
 void AP_DeathLinkSend() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     if (!enable_deathlink || !multiworld) return;
     if (cur_deathlink_amnesty > 0) {
         cur_deathlink_amnesty--;
@@ -416,75 +489,121 @@ void AP_DeathLinkSend() {
 }
 
 void AP_EnableQueueItemRecvMsgs(bool b) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     queueitemrecvmsg = b;
 }
 
 void AP_SetItemClearCallback(std::function<void()> f_itemclr) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     resetItemValues = f_itemclr;
 }
 
 void AP_SetItemRecvCallback(std::function<void(int64_t,int,bool)> f_itemrecv) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     getitemfunc = f_itemrecv;
 }
 
 void AP_SetLocationCheckedCallback(std::function<void(int64_t)> f_locrecv) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     checklocfunc = f_locrecv;
 }
 
 void AP_SetLocationInfoCallback(std::function<void(std::vector<AP_NetworkItem>)> f_locinfrecv) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     locinfofunc = f_locinfrecv;
 }
 
 void AP_SetDeathLinkRecvCallback(std::function<void()> f_deathrecv) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     recvdeath = [f_deathrecv](std::string, std::string){ f_deathrecv(); };
 }
 void AP_SetDeathLinkRecvCallback(std::function<void(std::string, std::string)> f_deathrecv) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     recvdeath = f_deathrecv;
 }
 
 void AP_RegisterSlotDataIntCallback(std::string key, std::function<void(int)> f_slotdata) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     map_slotdata_callback_int[key] = f_slotdata;
     slotdata_strings.push_back(key);
 }
 
 void AP_RegisterSlotDataRawCallback(std::string key, std::function<void(std::string)> f_slotdata) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     map_slotdata_callback_raw[key] = f_slotdata;
     slotdata_strings.push_back(key);
 }
 
 void AP_RegisterSlotDataMapIntIntCallback(std::string key, std::function<void(std::map<int,int>)> f_slotdata) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     map_slotdata_callback_mapintint[key] = f_slotdata;
     slotdata_strings.push_back(key);
 }
 
 void AP_SetDeathLinkSupported(bool supdeathlink) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     deathlinksupported = supdeathlink;
 }
 
 bool AP_DeathLinkPending() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return false;
     return deathlinkstat;
 }
 
 void AP_DeathLinkClear() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     deathlinkstat = false;
 }
 
 bool AP_IsMessagePending() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return false;
     return !messageQueue.empty();
 }
 
 AP_Message* AP_GetLatestMessage() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || messageQueue.empty()) return nullptr;
     return messageQueue.front();
 }
 
 void AP_ClearLatestMessage() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     if (AP_IsMessagePending()) {
         delete messageQueue.front();
         messageQueue.pop_front();
     }
 }
 
+AP_Message* AP_PopLatestMessage() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || messageQueue.empty()) return nullptr;
+    AP_Message* message = messageQueue.front();
+    messageQueue.pop_front();
+    return message;
+}
+
+void AP_FreeMessage(AP_Message* message) {
+    delete message;
+}
+
 void AP_Say(std::string text) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     Json::Value req_t;
     req_t[0]["cmd"] = "Say";
     req_t[0]["text"] = text;
@@ -492,12 +611,15 @@ void AP_Say(std::string text) {
 }
 
 int AP_GetRoomInfo(AP_RoomInfo* client_roominfo) {
-    if (!auth) return 1;
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || !auth || client_roominfo == nullptr) return 1;
     *client_roominfo = lib_room_info;
     return 0;
 }
 
 AP_ConnectionStatus AP_GetConnectionStatus() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return AP_ConnectionStatus::Disconnected;
     if (!multiworld && auth) return AP_ConnectionStatus::Authenticated;
     if (refused) {
         return AP_ConnectionStatus::ConnectionRefused;
@@ -512,7 +634,14 @@ AP_ConnectionStatus AP_GetConnectionStatus() {
     return AP_ConnectionStatus::Disconnected;
 }
 
+std::string AP_GetConnectionError() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    return connection_error;
+}
+
 AP_DataPackageSyncStatus AP_GetDataPackageStatus() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return AP_DataPackageSyncStatus::NotChecked;
     if (!auth) {
         return AP_DataPackageSyncStatus::NotChecked;
     }
@@ -524,15 +653,21 @@ AP_DataPackageSyncStatus AP_GetDataPackageStatus() {
 }
 
 std::uint64_t AP_GetUUID() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return 0;
     return ap_uuid;
 }
 
 int AP_GetPlayerID() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return 0;
     return ap_player_id;
 }
 
 void AP_SetServerData(AP_SetServerDataRequest* request) {
-    request->status = AP_RequestStatus::Pending;
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || request == nullptr) return;
+    request->status.store(AP_RequestStatus::Pending, std::memory_order_relaxed);
 
     Json::Value req_t;
     req_t[0]["cmd"] = "Set";
@@ -565,14 +700,18 @@ void AP_SetServerData(AP_SetServerDataRequest* request) {
     req_t[0]["want_reply"] = request->want_reply;
     map_serverdata_typemanage[request->key] = request->type;
     APSend(writer.write(req_t));
-    request->status = AP_RequestStatus::Done;
+    request->status.store(AP_RequestStatus::Done, std::memory_order_release);
 }
 
 void AP_RegisterSetReplyCallback(std::function<void(AP_SetReply)> f_setreply) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     setreplyfunc = f_setreply;
 }
 
 void AP_SetNotify(std::map<std::string,AP_DataType> keylist) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     Json::Value req_t;
     req_t[0]["cmd"] = "SetNotify";
     int i = 0;
@@ -591,9 +730,14 @@ void AP_SetNotify(std::string key, AP_DataType type) {
 }
 
 void AP_GetServerData(AP_GetServerDataRequest* request) {
-    request->status = AP_RequestStatus::Pending;
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down || request == nullptr) return;
+    request->status.store(AP_RequestStatus::Pending, std::memory_order_relaxed);
 
-    if (map_server_data.find(request->key) != map_server_data.end()) return;
+    if (map_server_data.find(request->key) != map_server_data.end()) {
+        request->status.store(AP_RequestStatus::Error, std::memory_order_release);
+        return;
+    }
 
     map_server_data[request->key] = request;
 
@@ -604,19 +748,27 @@ void AP_GetServerData(AP_GetServerDataRequest* request) {
 }
 
 std::string AP_GetPrivateServerDataPrefix() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return "";
     return "APCpp" + std::to_string(ap_player_name_hash) + "APCpp" + std::to_string(ap_player_id) + "APCpp";
 }
 
 std::string AP_GetLocationName(int64_t id) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return "";
     return getLocationName(ap_game, id);
 }
 
 std::string AP_GetItemName(int64_t id) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return "";
     return getItemName(ap_game, id);
 }
 
 
 void AP_SendBounce(AP_Bounce bounce) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     Json::Value req_t;
     req_t[0]["cmd"] = "Bounce";
 
@@ -639,6 +791,8 @@ void AP_SendBounce(AP_Bounce bounce) {
 }
 
 void AP_RegisterBouncedCallback(std::function<void(AP_Bounce)> f_bounced) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return;
     bouncedfunc = f_bounced;
 }
 
@@ -652,6 +806,8 @@ void AP_Init_Generic() {
 }
 
 bool parse_response(std::string msg, std::string &request) {
+    std::unique_lock<std::recursive_mutex> lock(state_mutex);
+    if (shutting_down) return false;
     Json::Value root;
     reader.parse(msg, root);
     for (unsigned int i = 0; i < root.size(); i++) {
@@ -702,12 +858,20 @@ bool parse_response(std::string msg, std::string &request) {
             // Avoid inconsistency if we disconnected before
             printf("AP: Authenticated\n");
             ap_player_id = root[i]["slot"].asInt(); // MUST be called before resetitemvalues, otherwise PrivateServerDataPrefix, GetPlayerID return broken values!
-            resetItemValues();
+            const auto reset_callback = resetItemValues;
+            if (reset_callback) {
+                CallUnlocked(lock, [&]{ reset_callback(); });
+                if (shutting_down) return false;
+            }
 
+            const auto location_callback = checklocfunc;
             for (unsigned int j = 0; j < root[i]["checked_locations"].size(); j++) {
                 //Sync checks with server
                 int64_t loc_id = root[i]["checked_locations"][j].asInt64();
-                checklocfunc(loc_id);
+                if (location_callback) {
+                    CallUnlocked(lock, [&]{ location_callback(loc_id); });
+                    if (shutting_down) return false;
+                }
             }
             for (unsigned int j = 0; j < root[i]["players"].size(); j++) {
                 AP_NetworkPlayer player = {
@@ -726,18 +890,25 @@ bool parse_response(std::string msg, std::string &request) {
             else if (root[i]["slot_data"]["DeathLink_Amnesty"] != Json::nullValue)
                 deathlink_amnesty = root[i]["slot_data"].get("DeathLink_Amnesty", 0).asInt();
             cur_deathlink_amnesty = deathlink_amnesty;
-            for (std::string key : slotdata_strings) {
+            const auto slot_keys = slotdata_strings;
+            for (const std::string& key : slot_keys) {
                 if (map_slotdata_callback_int.count(key)) {
-                    map_slotdata_callback_int.at(key)(root[i]["slot_data"][key].asInt());
+                    const auto callback = map_slotdata_callback_int.at(key);
+                    const int value = root[i]["slot_data"][key].asInt();
+                    CallUnlocked(lock, [&]{ callback(value); });
                 } else if (map_slotdata_callback_raw.count(key)) {
-                    map_slotdata_callback_raw.at(key)(writer.write(root[i]["slot_data"][key]));
+                    const auto callback = map_slotdata_callback_raw.at(key);
+                    const std::string value = writer.write(root[i]["slot_data"][key]);
+                    CallUnlocked(lock, [&]{ callback(value); });
                 } else if (map_slotdata_callback_mapintint.count(key)) {
+                    const auto callback = map_slotdata_callback_mapintint.at(key);
                     std::map<int,int> out;
                     for (auto itr : root[i]["slot_data"][key].getMemberNames()) {
                         out[std::stoi(itr)] = root[i]["slot_data"][key][itr.c_str()].asInt();
                     }
-                    map_slotdata_callback_mapintint.at(key)(out);
+                    CallUnlocked(lock, [&]{ callback(out); });
                 }
+                if (shutting_down) return false;
             }
 
             resync_serverdata_request.key = "APCppLastRecv" + ap_player_name + std::to_string(ap_player_id);
@@ -804,7 +975,7 @@ bool parse_response(std::string msg, std::string &request) {
                         *((std::string*)target->value) = writer.write(root[i]["keys"][itr]);
                         break;
                 }
-                target->status = AP_RequestStatus::Done;
+                target->status.store(AP_RequestStatus::Done, std::memory_order_release);
                 map_server_data.erase(itr);
             }
         } else if (cmd == "SetReply") {
@@ -837,7 +1008,9 @@ bool parse_response(std::string msg, std::string &request) {
                         setreply.original_value = &raw_orig_val;
                         break;
                 }
-                setreplyfunc(setreply);
+                const auto callback = setreplyfunc;
+                CallUnlocked(lock, [&]{ callback(setreply); });
+                if (shutting_down) return false;
             }
         } else if (cmd == "PrintJSON") {
             const std::string printType = root[i].get("type","").asString();
@@ -897,24 +1070,31 @@ bool parse_response(std::string msg, std::string &request) {
                 item.playerName = player.alias;
                 locations.push_back(item);
             }
-            if (locinfofunc) {
-                locinfofunc(locations);
+            const auto callback = locinfofunc;
+            if (callback) {
+                CallUnlocked(lock, [&]{ callback(locations); });
+                if (shutting_down) return false;
             } else {
                 printf("AP: Received LocationInfo but no handler registered!\n");
             }
         } else if (cmd == "ReceivedItems") {
             int item_idx = root[i]["index"].asInt();
             bool notify;
+            const auto item_callback = getitemfunc;
             for (unsigned int j = 0; j < root[i]["items"].size(); j++) {
                 int64_t item_id = root[i]["items"][j]["item"].asInt64();
                 notify = (item_idx == 0 && last_item_idx <= j && multiworld) || item_idx != 0;
                 AP_NetworkPlayer sender = getPlayer(0, root[i]["items"][j]["player"].asInt());
-                getitemfunc(item_id, sender.slot, notify);
+                if (item_callback) {
+                    CallUnlocked(lock, [&]{ item_callback(item_id, sender.slot, notify); });
+                    if (shutting_down) return false;
+                }
                 if (queueitemrecvmsg && notify) {
                     AP_ItemRecvMessage* msg = new AP_ItemRecvMessage;
                     msg->type = AP_MessageType::ItemRecv;
                     msg->item = getItemName(ap_game, item_id);
                     msg->sendPlayer = sender.alias;
+                    msg->location = root[i]["items"][j]["location"].asInt64();
                     msg->text = std::string("Received ") + msg->item + std::string(" from ") + msg->sendPlayer;
 					msg->messageParts = {{"Received "}, {msg->item, AP_ItemText}, {" from "}, {msg->sendPlayer, AP_PlayerText}};
                     messageQueue.push_back(msg);
@@ -935,9 +1115,13 @@ bool parse_response(std::string msg, std::string &request) {
             AP_SetServerData(&request);
         } else if (cmd == "RoomUpdate") {
             //Sync checks with server
+            const auto location_callback = checklocfunc;
             for (unsigned int j = 0; j < root[i]["checked_locations"].size(); j++) {
                 int64_t loc_id = root[i]["checked_locations"][j].asInt64();
-                checklocfunc(loc_id);
+                if (location_callback) {
+                    CallUnlocked(lock, [&]{ location_callback(loc_id); });
+                    if (shutting_down) return false;
+                }
             }
             //Update Player aliases if present
             for (auto itr : root[i].get("players", Json::arrayValue)) {
@@ -946,6 +1130,12 @@ bool parse_response(std::string msg, std::string &request) {
         } else if (cmd == "ConnectionRefused") {
             auth = false;
             refused = true;
+            connection_error.clear();
+            for (const auto& error : root[i]["errors"]) {
+                if (!connection_error.empty()) connection_error += ", ";
+                connection_error += error.asString();
+            }
+            if (connection_error.empty()) connection_error = "ConnectionRefused";
             printf("AP: Archipelago Server has refused connection. Check Password / Name / IP and restart the Game.\n");
             fflush(stdout);
         } else if (cmd == "Bounced") {
@@ -961,7 +1151,9 @@ bool parse_response(std::string msg, std::string &request) {
                         deathlinkstat = true;
                         if (recvdeath) {
                             std::string cause = root[i]["data"]["cause"].isNull() ? "" : root[i]["data"]["cause"].asString();
-                            recvdeath(source, cause);
+                            const auto callback = recvdeath;
+                            CallUnlocked(lock, [&]{ callback(source, cause); });
+                            if (shutting_down) return false;
                         }
                         break;
                     }
@@ -985,7 +1177,9 @@ bool parse_response(std::string msg, std::string &request) {
                 #undef ADD_TARGETS
 
                 bounce.data = writer.write(root[i]["data"]);
-                bouncedfunc(bounce);
+                const auto callback = bouncedfunc;
+                CallUnlocked(lock, [&]{ callback(bounce); });
+                if (shutting_down) return false;
             }
             
         }
