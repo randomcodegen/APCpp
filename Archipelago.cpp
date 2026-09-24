@@ -1095,6 +1095,7 @@ bool parse_response(std::string msg, std::string &request) {
                     msg->item = getItemName(ap_game, item_id);
                     msg->sendPlayer = sender.alias;
                     msg->location = root[i]["items"][j]["location"].asInt64();
+                    msg->flags = root[i]["items"][j]["flags"].asInt();
                     msg->text = std::string("Received ") + msg->item + std::string(" from ") + msg->sendPlayer;
 					msg->messageParts = {{"Received "}, {msg->item, AP_ItemText}, {" from "}, {msg->sendPlayer, AP_PlayerText}};
                     messageQueue.push_back(msg);

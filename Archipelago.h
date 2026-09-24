@@ -125,6 +125,7 @@ struct AP_ItemRecvMessage : AP_Message {
     std::string item;
     std::string sendPlayer;
     int64_t location = 0;
+    int flags = 0;
 };
 
 struct AP_HintMessage : AP_Message {

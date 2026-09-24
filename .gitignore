@@ -2,3 +2,4 @@ build/
 install/
 .cache/
 *_test.cpp
+APCpp_datapkg.cache
