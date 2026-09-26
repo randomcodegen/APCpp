@@ -34,19 +34,30 @@ void AP_SetNativePacketCallback(std::function<void(std::string)> callback) {
     native_packet_callback = callback;
 }
 
+std::string getLocationName(std::string game, int64_t id);
+AP_NetworkPlayer getPlayer(int team, int slot);
+
 void NativePacket(const Json::Value& packet) {
     const std::string command = packet[0]["cmd"].asString();
     if (command != "RoomInfo" && command != "Connected" && command != "ReceivedItems" &&
         command != "RoomUpdate" && command != "LocationInfo" && command != "ConnectionRefused" && command.compare(0, 6, "Native") != 0)
         return;
     std::function<void(std::string)> callback;
+    Json::Value outgoing = packet;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         callback = native_packet_callback;
+        if (callback && command == "ReceivedItems") {
+            for (auto& item : outgoing[0]["items"]) {
+                if (!item.isMember("location") || !item["location"].asInt64()) continue;
+                const auto sender = getPlayer(0, item["player"].asInt());
+                item["location_name"] = getLocationName(sender.game, item["location"].asInt64());
+            }
+        }
     }
     if (callback) {
         Json::FastWriter json;
-        callback(json.write(packet));
+        callback(json.write(outgoing));
     }
 }
 bool shutting_down = false;
