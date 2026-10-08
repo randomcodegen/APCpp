@@ -152,6 +152,13 @@ void localSetServerData(Json::Value req);
 std::string messagePartsToPlainText(const std::vector<AP_MessagePart>& messageParts);
 // PRIV Func Declarations End
 
+static void appendLocationParts(std::vector<AP_MessagePart>& parts, const std::string& game, const Json::Value& location) {
+    if (!location.isInt64()) return;
+    parts.push_back({" ("});
+    parts.push_back({getLocationName(game, location.asInt64()), AP_LocationText});
+    parts.push_back({")"});
+}
+
 template <typename Callback>
 void CallUnlocked(std::unique_lock<std::recursive_mutex>& lock, Callback callback) {
     lock.unlock();
@@ -1092,8 +1099,9 @@ bool parse_response(std::string msg, std::string &request) {
                 msg->flags = root[i]["item"].get("flags", 0).asInt();
                 msg->item = getItemName(recv_player.game, root[i]["item"]["item"].asInt64());
                 msg->recvPlayer = recv_player.alias;
-                msg->text = msg->item + std::string(" was sent to ") + msg->recvPlayer;
 				msg->messageParts = {{msg->item, AP_ItemText, msg->flags}, {" was sent to "}, {msg->recvPlayer, AP_PlayerText, 0, recv_player.slot}};
+                appendLocationParts(msg->messageParts, getPlayer(0, root[i]["item"]["player"].asInt()).game, root[i]["item"]["location"]);
+                msg->text = messagePartsToPlainText(msg->messageParts);
                 messageQueue.push_back(msg);
             } else if (printType == "Hint") {
                 AP_NetworkPlayer send_player = getPlayer(0, root[i]["item"]["player"].asInt());
@@ -1181,8 +1189,9 @@ bool parse_response(std::string msg, std::string &request) {
                     msg->sendPlayer = sender.alias;
                     msg->location = root[i]["items"][j]["location"].asInt64();
                     msg->flags = root[i]["items"][j]["flags"].asInt();
-                    msg->text = std::string("Received ") + msg->item + std::string(" from ") + msg->sendPlayer;
-					msg->messageParts = {{"Received "}, {msg->item, AP_ItemText}, {" from "}, {msg->sendPlayer, AP_PlayerText}};
+					msg->messageParts = {{"Received "}, {msg->item, AP_ItemText, msg->flags}, {" from "}, {msg->sendPlayer, AP_PlayerText, 0, sender.slot}};
+                    appendLocationParts(msg->messageParts, sender.game, root[i]["items"][j]["location"]);
+                    msg->text = messagePartsToPlainText(msg->messageParts);
                     messageQueue.push_back(msg);
                 }
             }
