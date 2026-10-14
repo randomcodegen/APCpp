@@ -70,6 +70,16 @@ std::string connection_error;
 bool multiworld = true;
 bool isSSL = true;
 bool ssl_success = false;
+
+static bool plaintext_tls_error(const char* reason) {
+    if (reason && (strstr(reason, "certificate") || strstr(reason, "Certificate") ||
+                   strstr(reason, "X509") || strstr(reason, "hostname"))) return false;
+    return reason && (strstr(reason, "wrong version number") ||
+                      strstr(reason, "unknown protocol") ||
+                      strstr(reason, "packet length too long") ||
+                      strstr(reason, "SSL - An invalid SSL record was received"));
+}
+
 bool data_synced = false;
 int ap_player_id;
 std::string ap_player_name;
@@ -176,6 +186,7 @@ void AP_Init(const char* ip, const char* game, const char* player_name, const ch
     if (shutting_down) return;
     multiworld = true;
     connection_error.clear();
+    ssl_success = false;
     
     uint64_t milliseconds_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     rando = std::mt19937(milliseconds_since_epoch);
@@ -232,6 +243,9 @@ void AP_Init(const char* ip, const char* game, const char* player_name, const ch
             }
             else if (msg->type == ix::WebSocketMessageType::Open)
             {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                if (shutting_down) return;
+                if (isSSL) ssl_success = true;
                 printf("AP: Connected to Archipelago\n");
                 Json::Value packet;
                 packet[0]["cmd"] = "NativeTransport";
@@ -249,12 +263,15 @@ void AP_Init(const char* ip, const char* game, const char* player_name, const ch
                 }
                 map_server_data.clear();
                 Json::Value packet;
+                const bool fallback = msg->type == ix::WebSocketMessageType::Error && isSSL && !ssl_success &&
+                                      plaintext_tls_error(msg->errorInfo.reason.c_str());
                 packet[0]["cmd"] = "NativeDisconnected";
                 packet[0]["reason"] = msg->errorInfo.reason;
+                packet[0]["fallback_pending"] = fallback;
                 NativePacket(packet);
                 printf("AP: Error connecting to Archipelago. Retries: %d\n", msg->errorInfo.retries-1);
-                if (msg->errorInfo.retries-1 >= 2 && isSSL && !ssl_success) {
-                    printf("AP: SSL connection failed. Attempting unencrypted...\n");
+                if (fallback) {
+                    printf("AP: TLS protocol mismatch. Retrying with ws://.\n");
                     webSocket.setUrl("ws://" + ap_ip);
                     isSSL = false;
                     packet[0]["cmd"] = "NativeFallback";

@@ -1,5 +1,5 @@
 build/
 install/
 .cache/
-*_test.cpp
+*test*
 APCpp_datapkg.cache
