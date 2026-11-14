@@ -108,12 +108,14 @@ enum struct AP_MessageType {
 };
 
 enum AP_MessagePartType {
-    AP_NormalText, AP_LocationText, AP_ItemText, AP_PlayerText
+    AP_NormalText, AP_LocationText, AP_ItemText, AP_PlayerText,
+    AP_EntranceText, AP_HintStatusText
 };
 
 struct AP_MessagePart {
     std::string text;
     AP_MessagePartType type = AP_NormalText;
+    // Item flags for AP_ItemText. Hint status code for AP_HintStatusText, or -1 if missing or non-integer.
     int flags = 0;
     int player = -1;
 };
@@ -151,6 +153,9 @@ struct AP_CountdownMessage : AP_Message {
 
 /* Message Management Functions */
 
+// enable entrance and hint status parts for subsequently received messages
+// off by default
+void AP_SetRichMessageParts(bool enabled);
 bool AP_IsMessagePending();
 void AP_ClearLatestMessage();
 // Legacy GetMessage: only single thread

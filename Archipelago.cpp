@@ -101,6 +101,7 @@ int cur_deathlink_amnesty = 0;
 // Message System
 std::deque<AP_Message*> messageQueue;
 bool queueitemrecvmsg = true;
+static bool rich_message_parts = false;
 
 // Data Maps
 std::map<int, AP_NetworkPlayer> map_players;
@@ -662,6 +663,11 @@ void AP_DeathLinkClear() {
     deathlinkstat = false;
 }
 
+void AP_SetRichMessageParts(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    rich_message_parts = enabled;
+}
+
 bool AP_IsMessagePending() {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     if (shutting_down) return false;
@@ -899,6 +905,38 @@ void AP_Init_Generic() {
     datapkg_cache_file.close();
 }
 
+static std::vector<AP_MessagePart> parse_message_parts(const Json::Value& data) {
+    std::vector<AP_MessagePart> parts;
+    if (!data.isArray()) return parts;
+    parts.reserve(data.size());
+    for (const auto& node : data) {
+        AP_MessagePart part;
+        const auto type = node.get("type", "").asString();
+        part.text = node.get("text", "").asString();
+        if (type == "player_id") {
+            part.player = std::stoi(part.text);
+            part.text = getPlayer(0, part.player).alias;
+            part.type = AP_PlayerText;
+        } else if (type == "player_name") {
+            part.type = AP_PlayerText;
+        } else if (type == "item_id" || type == "item_name") {
+            if (type == "item_id") part.text = getItemName(getPlayer(0, node["player"].asInt()).game, std::stoll(part.text));
+            part.type = AP_ItemText;
+            part.flags = node.get("flags", 0).asInt();
+        } else if (type == "location_id" || type == "location_name") {
+            if (type == "location_id") part.text = getLocationName(getPlayer(0, node["player"].asInt()).game, std::stoll(part.text));
+            part.type = AP_LocationText;
+        } else if (rich_message_parts && type == "entrance_name") {
+            part.type = AP_EntranceText;
+        } else if (rich_message_parts && type == "hint_status") {
+            part.type = AP_HintStatusText;
+            part.flags = node["hint_status"].isInt() ? node["hint_status"].asInt() : -1;
+        }
+        parts.push_back(std::move(part));
+    }
+    return parts;
+}
+
 bool parse_response(std::string msg, std::string &request) {
     std::unique_lock<std::recursive_mutex> lock(state_mutex);
     if (shutting_down) return false;
@@ -1132,6 +1170,10 @@ bool parse_response(std::string msg, std::string &request) {
                 msg->checked = root[i]["found"].asBool();
                 msg->text = std::string("Item ") + msg->item + std::string(" from ") + msg->sendPlayer + std::string(" to ") + msg->recvPlayer + std::string(" at ") + msg->location + std::string((msg->checked ? " (Checked)" : " (Unchecked)"));
 				msg->messageParts = {{"Item "}, {msg->item, AP_ItemText, root[i]["item"].get("flags", 0).asInt()}, {" from "}, {msg->sendPlayer, AP_PlayerText, 0, send_player.slot}, {" to "}, {msg->recvPlayer, AP_PlayerText, 0, recv_player.slot}, {" at "}, {msg->location, AP_LocationText}, {msg->checked ? " (Checked)" : " (Unchecked)"}};
+                if (rich_message_parts) {
+                    auto parts = parse_message_parts(root[i]["data"]);
+                    if (!parts.empty()) msg->messageParts = std::move(parts);
+                }
                 messageQueue.push_back(msg);
             } else if (printType == "Countdown") {
                 AP_CountdownMessage* msg = new AP_CountdownMessage;
@@ -1143,27 +1185,8 @@ bool parse_response(std::string msg, std::string &request) {
             } else {
                 AP_Message* msg = new AP_Message;
                 if (printType == "CommandResult") msg->type = AP_MessageType::CommandResult;
-                msg->text = "";
-                for (auto itr : root[i]["data"]) {
-                    AP_MessagePart part;
-                    const auto type = itr.get("type", "").asString();
-                    part.text = itr.get("text", "").asString();
-                    if (type == "player_id") {
-                        part.player = std::stoi(part.text);
-                        part.text = getPlayer(0, part.player).alias;
-                        part.type = AP_PlayerText;
-                    } else if (type == "player_name") part.type = AP_PlayerText;
-                    else if (type == "item_id" || type == "item_name") {
-                        if (type == "item_id") part.text = getItemName(getPlayer(0, itr["player"].asInt()).game, std::stoll(part.text));
-                        part.type = AP_ItemText;
-                        part.flags = itr.get("flags", 0).asInt();
-                    } else if (type == "location_id" || type == "location_name") {
-                        if (type == "location_id") part.text = getLocationName(getPlayer(0, itr["player"].asInt()).game, std::stoll(part.text));
-                        part.type = AP_LocationText;
-                    }
-                    msg->text += part.text;
-                    msg->messageParts.push_back(std::move(part));
-                }
+                msg->messageParts = parse_message_parts(root[i]["data"]);
+                msg->text = messagePartsToPlainText(msg->messageParts);
                 messageQueue.push_back(msg);
             }
         } else if (cmd == "LocationInfo") {

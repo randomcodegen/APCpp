@@ -46,6 +46,11 @@ To receive messages:
 - Receive with `AP_GetLatestMessage()`. This returns an AP_Message struct with a type and preconfigured presentable text for this message. If you want the game client to have more details for the message (for example to create a custom text) any non-plaintext type message can be casted to an AP_`TYPE`Message with some type-specific struct members providing additional information for the given message.
 - Clear the latest message with `AP_ClearLatestMessage()`.
 
+Call `AP_SetRichMessageParts(true)` before connecting to enable entrance and hint status spans in `AP_Message::messageParts`.  
+`AP_EntranceText` identifies entrance names.  
+`AP_HintStatusText` carries the server's numeric status in `flags`  
+(0 unspecified, 10 no priority, 20 avoid, 30 priority, 40 found)
+
 # Building
 Clone the Repo recursively!
 ## Linux
